@@ -701,9 +701,13 @@ type
     procedure LogVerbose(connection: TPollAsyncConnection; const ident: RawUtf8;
       const identargs: array of const; const data: TRawByteStringBuffer);
     /// the current monotonic time elapsed, evaluated in seconds
-    // - IdleEverySecond will set GetTickCount64 div 1000 = GetTickSec
+    // - GetTickSecs value set at most every 500ms by ProcessIdleTix()
     property LastOperationSec: TAsyncConnectionSec
       read fLastOperationSec;
+    /// the current monotonic time elapsed, evaluated in milliseconds
+    // - GetTickCount64 value set at most every 500ms by ProcessIdleTix()
+    property LastOperationMS: Int64
+      read fLastOperationMS;
     /// allow idle connection to release its internal Connection.rd/wr buffers
     // - default is 60 seconds, which is pretty conservative
     // - could be tuned in case of high numbers of concurrent connections and
@@ -1033,7 +1037,7 @@ type
       aConnectionTimeoutSec: integer); reintroduce;
     /// start an async connection to a remote HTTP server using a callback
     // - the aOnStateChanged event will be called after each http.State change
-    function StartRequest(const aUrl, aMethod, aHeaders: RawUtf8;
+    function StartRequest(var aUrl: TUri; const aMethod, aHeaders: RawUtf8;
       const aOnStateChanged: TOnHttpClientAsync;
       aTls: PNetTlsContext; const aDestFileName: TFileName;
       out aConnection: THttpAsyncClientConnection;
@@ -1061,7 +1065,7 @@ type
     fInterning: PRawUtf8InterningSlot;
     fInterningTix: cardinal;
     fExecuteEvent: TSynEvent;
-    fSockets: THttpAsyncClientConnections; // allocated when needed
+    fClientSockets: THttpAsyncClientConnections; // allocated when needed
     fHttpDateNowUtc: THttpDateNowUtc;
     function GetHttpQueueLength: cardinal; override;
     procedure SetHttpQueueLength(aValue: cardinal); override;
@@ -1160,15 +1164,35 @@ type
       read fPath write fPath;
   end;
 
+  /// set of THttpProxyUrl.Options items, used to refine a specific URI process
+  // - hpoNoSubFolder disable access to any sub-folder within this URI
+  // - hpoNoFolderHtmlIndex disable the HTML index generation at folder level
+  // - hpoPublishMd5/psoPublishSha1/psoPublishSha256 enable hash content
+  // generation on server side with .md5/.sha1/.sha256 extension on a resource
+  // - hpoDisable304 disable "if-none-match:" / "if-modified-since:" headers
+  // default support as efficient 304 HTTP_NOTMODIFIED response
+  // - hpoClientOnlySocket will be used for THttpProxyUrl.RemoteClientHead()
+  THttpProxyUrlOption = (
+    hpoNoSubFolder,
+    hpoNoFolderHtmlIndex,
+    hpoDisableFolderHtmlIndexCache,
+    hpoPublishMd5,
+    hpoPublishSha1,
+    hpoPublishSha256,
+    hpoDisable304,
+    hpoClientOnlySocket);
+  /// store THttpProxyUrl options for a given URI
+  THttpProxyUrlOptions = set of THttpProxyUrlOption;
+
   /// define one URL content setting for THttpProxyServer
-  THttpProxyUrl = class(TSynAutoCreateFields)
+  THttpProxyUrl = class(TSynPersistent)
   protected
     fUrl, fSource: RawUtf8;
     fDisabled: boolean;
-    fIfModifiedSince: boolean;
+    fOptions: THttpProxyUrlOptions;
     fMethods: TUriRouterMethods;
     fSourced: (sUndefined, sLocalFolder, sRemoteUri);
-    fAlgos: THashAlgos;
+    fAlgos: THashAlgos; // hfMD5,hfSha1,hfSha256
     fCacheControlMaxAgeSec: integer;
     fMemCache: THttpProxyMem;
     fDiskCache: THttpProxyDisk;
@@ -1176,10 +1200,13 @@ type
     fLocalFolder: TFileName;
     fRemoteUri: TUri;
     fMemCached: TSynDictionary;  // Uri:RawUtf8 / Content:RawByteString
-    fHashCached: TSynDictionary; // Uri: RawUtf8 / sha256+md5: TRawUtf8DynArray
+    fHashCached: TSynDictionary; // Uri: RawUtf8 / hash[fAlgos]: TRawUtf8DynArray
     fReject: TUriMatch;
+    fRemoteClient: IHttpClient;
+    fRemoteClientSafe: TOSLightLock;
     function ReturnHash(ctxt: THttpServerRequestAbstract; h: THashAlgo;
       const name: RawUtf8; var fn: TFileName): integer;
+    function RemoteClientHead(const uri: TUri; var header: RawUtf8): cardinal;
   public
     /// setup the default values of this URL
     constructor Create; override;
@@ -1200,11 +1227,11 @@ type
     /// a local folder name or remote origin URL to ask
     // - if Source is a local folder (e.g. 'd:/mysite' or '/var/www/mysite'),
     // the Url prefix chars will be removed from the client request, then used
-    // to locate the file to be served
-    // - if Source is a remote URI (like http://....), the Url prefix chars
-    // will be removed from the client request, then appended
-    // to this remote URI, which is e.g. 'http://ftp.debian.org/debian' or
-    // 'http://security.debian.org/debian-security' matching Local 'debian' or
+    // to locate the file to be served within this local folder
+    // - if Source is a remote URI (like http://....), the Url prefix chars will
+    // be removed from the client request, then appended to this remote URI for
+    // remote proxy with caching, which is e.g. 'http://ftp.debian.org/debian'
+    // 'or http://security.debian.org/debian-security' matching Local 'debian' or
     // 'debian-security' prefixes, to compute a source remote URI
     property Source: RawUtf8
       read fSource write fSource;
@@ -1213,12 +1240,12 @@ type
     // - equals by default [urmGet, urmHead]
     property Methods: TUriRouterMethods
       read fMethods write fMethods;
-    /// handle "if-modified-since:" client header as 304 HTTP_NOTMODIFIED
-    // - default true will support 304 results against the resource timestamp
-    property IfModifiedSince: boolean
-      read fIfModifiedSince write fIfModifiedSince;
+    /// refined the process of this URI definition
+    property Options: THttpProxyUrlOptions
+      read fOptions write fOptions;
     /// support optional "Cache-Control: max-age=..." header timeout value
     // - default 0 value will disable this header transmission
+    // - to be used in conjunction with the hpoIfModifiedSince option
     property CacheControlMaxAgeSec: integer
       read fCacheControlMaxAgeSec write fCacheControlMaxAgeSec;
     /// overwrite the main MemCache setting to tune in-memory caching
@@ -1236,17 +1263,23 @@ type
   THttpProxyUrlObjArray = array of THttpProxyUrl;
 
   /// the available high-level options for THttpProxyServerMainSettings
+  // - psoLogVerbose could be used to debug a server in production
+  // - psoExcludeDateHeader won't include the default "Date: ..." HTTP header
+  // - psoHttpsSelfSigned will enable HTTPS with a self-signed certificate
+  // - psoReusePort will set SO_REUSEPORT on POSIX, to bind several servers
+  // - psoEnableLogging enable an associated THttpServerGeneric.Logger instance
+  // - psoRejectBotUserAgent identifies and rejects Bots via IsHttpUserAgentBot()
+  // - psoBan40xIP will reject any IP for a few seconds after a 4xx error code
+  // - psoDisableMemCache will globally disable all MemCache settings
   THttpProxyServerOption = (
     psoLogVerbose,
     psoExcludeDateHeader,
     psoHttpsSelfSigned,
     psoReusePort,
     psoEnableLogging,
-    psoDisableMemCache,
-    psoNoFolderHtmlIndex,
-    psoDisableFolderHtmlIndexCache,
-    psoPublishSha256,
-    psoPublishMd5);
+    psoRejectBotUserAgent,
+    psoBan40xIP,
+    psoDisableMemCache);
 
   /// a set of available options for THttpProxyServerMainSettings
   THttpProxyServerOptions = set of THttpProxyServerOption;
@@ -1321,11 +1354,11 @@ type
     constructor Create; override;
     /// append and own a given THttpProxyUrl definition at runtime
     // - this instance will be stored and owned in Url[] array
-    procedure AddUrl(one: THttpProxyUrl);
+    function AddUrl(one: THttpProxyUrl): THttpProxyUrl;
     /// create a THttpProxyUrl definition to serve a local static folder
     // - if optional ExceptionClass is supplied, the local folder should exist
-    procedure AddFolder(const folder: TFileName; const uri: RawUtf8 = '';
-      RaiseExceptionOnNonExistingFolder: ExceptionClass = nil);
+    function AddFolder(const folder: TFileName; const uri: RawUtf8 = '';
+      RaiseExceptionOnNonExistingFolder: ExceptionClass = nil): THttpProxyUrl;
   published
     /// define the HTTP/HTTPS server configuration
     property Server: THttpProxyServerMainSettings
@@ -1357,12 +1390,13 @@ type
     function SetupTls(var tls: TNetTlsContext): boolean; virtual;
     procedure AfterServerStarted; virtual;
     function OnExecute(Ctxt: THttpServerRequestAbstract): cardinal;
-    function OnExecuteLocal(Ctxt: THttpServerRequestAbstract;
-      Definition: THttpProxyUrl; const Uri: TUriMatchName): cardinal;
+    function OnGetHead(Ctxt: THttpServerRequestAbstract; Def: THttpProxyUrl;
+      Met: TUriRouterMethod; const Uri: TUriMatchName): cardinal;
   public
     /// initialize this forward proxy instance
     // - the supplied aSettings should be owned by the caller (e.g from a main
-    // settings class instance)
+    // settings class instance) - if nil is supplied, this instance will setup
+    // and own its own instance
     constructor Create(aSettings: THttpProxyServerSettings); reintroduce; virtual;
     /// finalize this class instance
     destructor Destroy; override;
@@ -4289,13 +4323,12 @@ begin
   fUserAgent := DefaultUserAgent(self);
 end;
 
-function THttpAsyncClientConnections.StartRequest(
-  const aUrl, aMethod, aHeaders: RawUtf8; const aOnStateChanged: TOnHttpClientAsync;
+function THttpAsyncClientConnections.StartRequest(var aUrl: TUri;
+  const aMethod, aHeaders: RawUtf8; const aOnStateChanged: TOnHttpClientAsync;
   aTls: PNetTlsContext; const aDestFileName: TFileName;
   out aConnection: THttpAsyncClientConnection;
   aOnStateChange: TOnHttpClientStates): TNetResult;
 var
-  uri: TUri;
   addr: TNetAddr;
   sock: TNetSocket;
   h: THandle;
@@ -4307,14 +4340,14 @@ begin
      not Assigned(aOnStateChanged) then
     result := nrNotImplemented
   else if (aMethod = '') or
-          not uri.From(aUrl) then
+          (aUrl.Server = '') then
     result := nrNotFound
   else
-    result := addr.SetFrom(uri.Server, uri.Port, nlTcp);
+    result := addr.SetFrom(aUrl.Server, aUrl.Port, nlTcp);
   if result <> nrOk then
   begin
-    fOwner.DoLog(sllDebug, 'StartRequest(% %)=%',
-      [aMethod, aUrl, ToText(result)^], self);
+    fOwner.DoLog(sllDebug, 'StartRequest(% %/%)=%',
+      [aMethod, aUrl.Server, aUrl.Address, ToText(result)^], self);
     exit;
   end;
   // create a new HttpAsyncClientConnection instance (and its socket)
@@ -4330,8 +4363,8 @@ begin
       exit;
     if aDestFileName <> '' then
     begin
-      fOwner.DoLog(sllTrace, 'StartRequest(% %) %',
-        [aMethod, aUrl, aDestFileName], self);
+      fOwner.DoLog(sllTrace, 'StartRequest(% %/%) %',
+        [aMethod, aUrl.Server, aUrl.Address, aDestFileName], self);
       h := FileCreate(aDestFileName);
       if not ValidHandle(h) then
       begin
@@ -4343,21 +4376,21 @@ begin
       include(aConnection.fHttp.ResponseFlags, rfContentStreamNeedFree);
     end;
     aConnection.fHttp.CommandMethod := aMethod;
-    aConnection.fHttp.CommandUri := uri.Address;
+    aConnection.fHttp.CommandUri := aUrl.Address;
     aConnection.fHttp.UserAgent := fUserAgent;
     if aHeaders <> '' then
       aConnection.fHttp.Headers := PurgeHeaders(aHeaders, {trim=}true);
     aConnection.fHttp.Head.Reserve(2048); // prepare for 2KB headers
-    if uri.Port = DEFAULT_PORT[aTls <> nil] then
-      aConnection.fHttp.Host := uri.Server
+    if aUrl.Port = DEFAULT_PORT[aTls <> nil] then
+      aConnection.fHttp.Host := aUrl.Server
     else
-      Append(aConnection.fHttp.Host, [uri.Server, ':', uri.Port]);
+      Append(aConnection.fHttp.Host, [aUrl.Server, ':', aUrl.Port]);
     aConnection.fOnStateChange := aOnStateChange;
     aConnection.fOnStateChanged := aOnStateChanged;
     // optionally prepare for TLS
     result := nrNotImplemented;
     if (aTls <> nil) or
-       uri.Https then
+       aUrl.Https then
     begin
       if aTls <> nil then
         aConnection.fTls := aTls^;
@@ -4383,7 +4416,8 @@ begin
     if result <> nrOk then
     try
       aConnection.NotifyStateChange(hcsFailed);
-      fOwner.DoLog(sllDebug, 'StartRequest(%)=%', [aUrl, ToText(result)^], self);
+      fOwner.DoLog(sllDebug, 'StartRequest(% %/%)=%',
+        [aMethod, aUrl.Server, aUrl.Address, ToText(result)^], self);
     finally
       FreeAndNil(aConnection);
     end;
@@ -5041,15 +5075,15 @@ begin
   // abort pending async processes
   if fAsync <> nil then
     fAsync.Shutdown;
-  if fSockets <> nil then
-    fSockets.Shutdown;
+  if fClientSockets<> nil then
+    fClientSockets.Shutdown;
   // terminate the Execute thread
   if fExecuteEvent <> nil then
     fExecuteEvent.SetEvent;
   inherited Destroy;
   // finalize all thread-pooled connections
   FreeAndNilSafe(fAsync);
-  FreeAndNilSafe(fSockets);
+  FreeAndNilSafe(fClientSockets);
   // release associated context
   if fInterning <> nil then
   begin
@@ -5101,14 +5135,14 @@ end;
 
 function THttpAsyncServer.Clients: THttpAsyncClientConnections;
 begin
-  if fSockets = nil then
-  begin
-    fSafe.Lock;
-    if fSockets = nil then
-      fSockets := THttpAsyncClientConnections.Create(fAsync, {timeoutsec=}0);
-    fSafe.UnLock;
-  end;
-  result := fSockets;
+  result := fClientSockets;
+  if result <> nil then
+    exit;
+  fSafe.Lock;
+  if fClientSockets = nil then
+    fClientSockets := THttpAsyncClientConnections.Create(fAsync, {timeoutsec=}0);
+  fSafe.UnLock;
+  result := fClientSockets;
 end;
 
 function THttpAsyncServer.GetExecuteState: THttpServerExecuteState;
@@ -5314,7 +5348,8 @@ constructor THttpProxyUrl.Create;
 begin
   inherited Create;
   fMethods := [urmGet, urmHead];
-  fIfModifiedSince := true;
+  fOptions := [];
+  fRemoteClientSafe.Init;
 end;
 
 destructor THttpProxyUrl.Destroy;
@@ -5322,6 +5357,7 @@ begin
   inherited Destroy;
   FreeAndNil(fMemCached);
   FreeAndNil(fHashCached);
+  fRemoteClientSafe.Done;
 end;
 
 function THttpProxyUrl.ReturnHash(ctxt: THttpServerRequestAbstract; h: THashAlgo;
@@ -5340,7 +5376,7 @@ begin
     i := length(fn);
     while i > 0 do
       if fn[i] = '.' then
-        break // remove the .sha256 or .md5 file extension
+        break // remove the .md5/.sha1/.sha256 file extension
       else
         dec(i);
     if i = 0 then
@@ -5364,6 +5400,19 @@ begin
       end
       else
         inc(i);
+end;
+
+function THttpProxyUrl.RemoteClientHead(const uri: TUri;
+  var header: RawUtf8): cardinal;
+begin
+  fRemoteClientSafe.Lock;
+  try
+    if fRemoteClient = nil then
+      fRemoteClient := TSimpleHttpClient.Create(hpoClientOnlySocket in fOptions);
+    result := fRemoteClient.Request(uri, 'HEAD', '', '', '', {keepalive=}30000);
+  finally
+    fRemoteClientSafe.UnLock;
+  end;
 end;
 
 
@@ -5395,36 +5444,36 @@ end;
 constructor THttpProxyServerSettings.Create;
 begin
   inherited Create;
+  // set default values in this main instance
   fDiskCache.Path := Executable.ProgramFilePath + 'proxycache';
   fMemCache.MaxSize := 4096;
   fMemCache.TimeoutSec := 15 * SecsPerMin;
 end;
 
-procedure THttpProxyServerSettings.AddUrl(one: THttpProxyUrl);
+function THttpProxyServerSettings.AddUrl(one: THttpProxyUrl): THttpProxyUrl;
 begin
-  if one <> nil then
-    if one.Source = '' then
-      one.Free
+  result := one;
+  if result <> nil then
+    if result.Source = '' then
+      FreeAndNil(result)
     else
-      ObjArrayAdd(fUrl, one); // will be owned as fUri[]
+      ObjArrayAdd(fUrl, result); // will be owned as fUri[]
 end;
 
-procedure THttpProxyServerSettings.AddFolder(const folder: TFileName;
-  const uri: RawUtf8; RaiseExceptionOnNonExistingFolder: ExceptionClass);
-var
-  one: THttpProxyUrl;
+function THttpProxyServerSettings.AddFolder(const folder: TFileName;
+  const uri: RawUtf8; RaiseExceptionOnNonExistingFolder: ExceptionClass): THttpProxyUrl;
 begin
   if RaiseExceptionOnNonExistingFolder <> nil then
     if not DirectoryExists(folder) then
       raise RaiseExceptionOnNonExistingFolder.CreateFmt(
         '%s.AddFolder: %s does not exist', [ClassNameShort(self)^, folder]);
-  one := THttpProxyUrl.Create;
-  one.Url := uri;
+  result := THttpProxyUrl.Create;
+  result.Url := uri;
   if RaiseExceptionOnNonExistingFolder = nil then
     RaiseExceptionOnNonExistingFolder := EHttpProxyServer;
-  one.Source := StringToUtf8(EnsureDirectoryExists(
+  result.Source := StringToUtf8(EnsureDirectoryExists(
     folder, RaiseExceptionOnNonExistingFolder));
-  AddUrl(one);
+  result := AddUrl(result);
 end;
 
 
@@ -5465,7 +5514,7 @@ begin
   fLog.EnterLocal(log, 'Start %', [fSettings], self);
   if fServer <> nil then
     EHttpProxyServer.RaiseUtf8('Duplicated %.Start', [self]);
-  // compute options from settings
+  // compute THttpAsyncServer options from settings
   hso := [hsoNoXPoweredHeader,
           hsoIncludeDateHeader,
           hsoThreadSmooting];
@@ -5478,6 +5527,10 @@ begin
     include(hso, hsoReusePort);
   if psoEnableLogging in fSettings.Server.Options then
     include(hso, hsoEnableLogging);
+  if psoRejectBotUserAgent in fSettings.Server.Options then
+    include(hso, hsoRejectBotUserAgent);
+  if psoBan40xIP in fSettings.Server.Options then
+    include(hso, hsoBan40xIP);
   tls.PrivatePassword := aPrivateKeyPassword; // if not in fSettings
   if (psoHttpsSelfSigned in fSettings.Server.Options) or
      SetupTls(tls) then
@@ -5543,7 +5596,7 @@ begin
       // validate source as local file folder or remote http(s) server
       one.fSourced := sUndefined;
       if IsHttp(one.Source) then
-      begin
+      begin // detect also 'http://unix:/path/to/socket.sock:/url/path'
         if one.fRemoteUri.From(one.Source) then
           one.fSourced := sRemoteUri;
       end
@@ -5574,14 +5627,23 @@ begin
             TypeInfo(TRawByteStringDynArray), PathCaseInsensitive,
             one.MemCache.TimeoutSec);
         if one.fSourced = sRemoteUri then
+        begin
           if one.DiskCache.MaxSize < 0 then
             one.DiskCache.MaxSize := fSettings.DiskCache.MaxSize;
+          if one.DiskCache.Path = '' then
+            one.DiskCache.Path := fSettings.DiskCache.Path;
+          if one.DiskCache.TimeoutSec <= 0 then
+            one.DiskCache.TimeoutSec := fSettings.DiskCache.TimeoutSec;
+        end;
       end;
+      // prepare optional hash cache
       one.fAlgos := [];
-      if psoPublishSha256 in fSettings.Server.Options then
-        include(one.fAlgos, hfSha256);
-      if psoPublishMd5 in fSettings.Server.Options then
+      if hpoPublishMd5 in one.Options then
         include(one.fAlgos, hfMd5);
+      if hpoPublishSha1 in one.Options then
+        include(one.fAlgos, hfSha1);
+      if hpoPublishSha256 in one.Options then
+        include(one.fAlgos, hfSha256);
       if one.fAlgos <> [] then
         one.fHashCached := TSynDictionary.Create(TypeInfo(TRawUtf8DynArray),
           TypeInfo(TRawUtf8DynArrayDynArray), PathCaseInsensitive, SecsPerHour);
@@ -5610,46 +5672,61 @@ begin
   end;
 end;
 
-function THttpProxyServer.OnExecuteLocal(Ctxt: THttpServerRequestAbstract;
-  Definition: THttpProxyUrl; const Uri: TUriMatchName): cardinal;
+function THttpProxyServer.OnGetHead(Ctxt: THttpServerRequestAbstract;
+  Def: THttpProxyUrl; Met: TUriRouterMethod; const Uri: TUriMatchName): cardinal;
 var
   fn: TFileName;
   name: RawUtf8;
   cached: RawByteString;
-  tix, siz: Int64;
+  tix64, siz: Int64;
   ext: PUtf8Char;
   pck: THttpProxyCacheKind;
 begin
   // delete any deprecated cached content
-  tix := Int64(fServer.Async.LastOperationSec) * 1000; // = GetTickCount64
-  Definition.fMemCached.DeleteDeprecated(tix);
-  Definition.fHashCached.DeleteDeprecated(tix);
-  // supplied URI should be a safe local file
-  result := HTTP_NOTFOUND;
-  UrlDecodeVar(Uri.Path.Text, Uri.Path.Len, name, {space=}'+');
-  NormalizeFileNameU(name);
+  tix64 := fServer.Async.LastOperationMS; // set by ProcessIdleTix()
+  Def.fMemCached.DeleteDeprecated(tix64);
+  Def.fHashCached.DeleteDeprecated(tix64);
+  // supplied URI should be a safe resource reference
+  result := HTTP_FORBIDDEN; // 403
+  // local the resource from its source
   if not SafePathNameU(name) then
     exit;
-  // try to assign a local file to the output Ctxt
-  fn := FormatString('%%', [Definition.fLocalFolder, name]);
-  result := Ctxt.SetOutFile(fn, Definition.IfModifiedSince, '',
-    Definition.CacheControlMaxAgeSec, @siz); // to be streamed from file
+  case Def.fSourced of
+    sLocalFolder:
+      begin
+        // try to assign a local file to the output Ctxt
+        UrlDecodeVar(Uri.Path.Text, Uri.Path.Len, name, {space=}'+');
+        NormalizeFileNameU(name);
+        if hpoNoSubFolder in Def.Options then
+          if PosExChar(PathDelim, name) <> 0 then
+            exit;
+        fn := MakeString([Def.fLocalFolder, name]);
+        result := Ctxt.SetOutFile(fn, not(hpoDisable304 in Def.Options), '',
+          Def.CacheControlMaxAgeSec, @siz); // to be streamed from file
+      end;
+    sRemoteUri:
+      begin
+
+      end;
+  else
+    exit;
+  end;
   // complete the actual URI process
   case result of
     HTTP_SUCCESS:
-      // this local file does exist: try if we could use Definition.MemCache
-      if Assigned(Definition.fMemCached) then
+      // this local file does exist: try if we could use Def.MemCache
+      if Assigned(Def.fMemCached) then
       begin
-        pck := Definition.MemCache.FromUri(Uri);
+        pck := Def.MemCache.FromUri(Uri);
         if not (pckIgnore in pck) then
           if (pckForce in pck) or
-             (siz <= Definition.MemCache.MaxSize) then
+             (siz <= Def.MemCache.MaxSize) then
           begin
             // use a memory cache
-            if not Definition.fMemCached.FindAndCopy(name, cached) then
+            if not Def.fMemCached.FindAndCopy(name, cached) then
             begin
               cached := StringFromFile(fn);
-              Definition.fMemCached.Add(name, cached);
+              Def.fMemCached.Add(name, cached);
             end;
             Ctxt.ExtractOutContentType; // reverse Ctxt.SetOutFile(fn)
             Ctxt.OutContent := cached;
@@ -5658,31 +5735,35 @@ begin
     HTTP_NOTFOUND:
       // this URI is no file, but may be a folder
       if (siz < 0) and // siz=-1 for folder
-         not (psoNoFolderHtmlIndex in fSettings.Server.Options) then
+         not (hpoNoFolderHtmlIndex in Def.Options) then
       begin
         // return the folder files info as cached HTML
-        if (psoDisableFolderHtmlIndexCache in fSettings.Server.Options) or
-           not Definition.fMemCached.FindAndCopy(name, cached) then
+        if (hpoDisableFolderHtmlIndexCache in Def.Options) or
+           not Def.fMemCached.FindAndCopy(name, cached) then
         begin
           FolderHtmlIndex(fn, Ctxt.Url,
-            StringReplaceChars(name, PathDelim, '/'), RawUtf8(cached));
-          if Assigned(Definition.fMemCached) and
-             not (psoDisableFolderHtmlIndexCache in fSettings.Server.Options) then
-            Definition.fMemCached.Add(name, cached);
+            StringReplaceChars(name, PathDelim, '/'),
+            RawUtf8(cached), hpoNoSubFolder in Def.Options);
+          if Assigned(Def.fMemCached) and
+             not (hpoDisableFolderHtmlIndexCache in Def.Options) then
+            Def.fMemCached.Add(name, cached);
         end;
-        result := Ctxt.SetOutContent(cached, {304=}true, HTML_CONTENT_TYPE);
+        result := Ctxt.SetOutContent(cached,
+                    not(hpoDisable304 in Def.Options), HTML_CONTENT_TYPE);
       end
       else if siz = 0 then
-        // URI may be a  ####.sha256 / ####.md5 hash
-        if Assigned(Definition.fHashCached) then
+        // check URI for any .md5/.sha1/.sha256 hash extension
+        if Assigned(Def.fHashCached) then
         begin
           ext := ExtractExtP(name, {withoutdot:}true);
           if ext <> nil then
             case PCardinal(ext)^ of
-              ord('s') + ord('h') shl 8 + ord('a') shl 16 + ord('2') shl 24:
-                result := Definition.ReturnHash(Ctxt, hfSHA256, name, fn);
               ord('m') + ord('d') shl 8 + ord('5') shl 16:
-                result := Definition.ReturnHash(Ctxt, hfMd5, name, fn);
+                result := Def.ReturnHash(Ctxt, hfMd5, name, fn);
+              ord('s') + ord('h') shl 8 + ord('a') shl 16 + ord('1') shl 24:
+                result := Def.ReturnHash(Ctxt, hfSHA1, name, fn);
+              ord('s') + ord('h') shl 8 + ord('a') shl 16 + ord('2') shl 24:
+                result := Def.ReturnHash(Ctxt, hfSHA256, name, fn);
             end;
         end;
   end; // may be e.g. HTTP_NOTMODIFIED (304)
@@ -5696,16 +5777,20 @@ var
   uri: TUriMatchName;
   met: TUriRouterMethod;
 begin
-  result := HTTP_NOTFOUND;
+  result := HTTP_NOTFOUND; // 404 by default
   // retrieve O(1) execution context
   one := Ctxt.RouteOpaque;
   if (one = nil) or
-     one.Disabled then
+     one.Disabled or
+     (one.fSourced = sUndefined) then
     exit;
   // validate the request method
   if not (UriMethod(Ctxt.Method, met) and
           (met in one.Methods)) then
+  begin
+    result := HTTP_NOTALLOWED; // 405 Method Not Allowed
     exit;
+  end;
   // retrieve path and resource/file name from URI
   Ctxt.RouteAt(0, uri.Path);
   if uri.Path.Len > 512 then // obviously invalid
@@ -5714,19 +5799,23 @@ begin
   // ensure was not marked as rejected
   if (one.RejectCsv <> '') and
      one.fReject.Check(one.RejectCsv, uri, PathCaseInsensitive) then
+  begin
+    result := HTTP_FORBIDDEN; // 403
     exit;
+  end;
   // actual request processing
-  case one.fSourced of
-    sLocalFolder:
-      case met of
-        urmGet,
-        urmHead:
-          result := OnExecuteLocal(Ctxt, one, uri);
-      end;
-    sRemoteUri:
-      begin
-        { TODO: implement progressive proxy cache on a remote server }
-      end;
+  case met of
+    urmGet,
+    urmHead:
+      result := OnGetHead(Ctxt, one, met, uri);
+    urmPost,
+    urmPut,
+    urmDelete:
+      if one.fSourced <> sRemoteUri then
+        result := HTTP_NOTALLOWED // 405 Method Not Allowed
+      else
+      { TODO: implement proxy with POST/PUT/DELETE }
+        ;
   end;
 end;
 

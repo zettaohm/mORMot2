@@ -447,7 +447,7 @@ type
   // - hsoNoXPoweredHeader excludes 'X-Powered-By: mORMot 2 synopse.info' header
   // - hsoCreateSuspended won't start the server thread immediately
   // - hsoLogVerbose could be used to debug a server in production
-  // - hsoIncludeDateHeader will let all answers include a Date: ... HTTP header
+  // - hsoIncludeDateHeader will always include a "Date: ..." HTTP header
   // - hsoEnableTls enables TLS support for THttpServer socket server, using
   // Windows SChannel API or OpenSSL - call WaitStarted() to set the certificates
   // - hsoBan40xIP will reject any IP for a few seconds after a 4xx error code
@@ -467,7 +467,7 @@ type
   // per-minute metrics logging via an associated THttpServerGeneric.Analyzer
   // - hsoContentTypeNoGuess will disable content-type detection from small
   // content buffers via GetMimeContentTypeFromBuffer()
-  // - hsoRejectBotUserAgent identifis and reject Bots via IsHttpUserAgentBot()
+  // - hsoRejectBotUserAgent identifies and rejects Bots via IsHttpUserAgentBot()
   THttpServerOption = (
     hsoHeadersUnfiltered,
     hsoHeadersInterning,
@@ -1527,7 +1527,7 @@ type
   PHttpPeerCacheMessageEncoded = ^THttpPeerCacheMessageEncoded;
 
   /// each THttpPeerCacheSettings.Options item
-  // - pcoCacheTempSubFolders will create 16 sub-folders (from first 0-9/a-z
+  // - pcoCacheTempSubFolders will create 16 sub-folders (from first 0-9/a-f
   // hash nibble) within CacheTempPath to reduce filesystem fragmentation
   // - pcoCacheTempNoCheckSize will ignore checking CacheTempMaxMB ratio on disk
   // - pcoUseFirstResponse will accept the first positive response, and don't
@@ -1579,11 +1579,11 @@ type
     fOptions: THttpPeerCacheOptions;
     fLimitMBPerSec, fLimitClientCount,
     fBroadcastTimeoutMS, fBroadcastMaxResponses, fBroadCastDirectMinBytes,
-    fTryAllPeersCount, fHttpTimeoutMS, fRejectInstablePeersMin,
+    fTryAllPeersCount, fHttpTimeoutMS, fRejectInstablePeersMin: integer;
     fCacheTempMaxMB, fCacheTempMaxMin,
     fCacheTempMinBytes, fCachePermMinBytes: integer;
-    fInterfaceName, fUuid: RawUtf8;
     fCacheTempPath, fCachePermPath: TFileName;
+    fInterfaceName, fUuid: RawUtf8;
   public
     /// set the default settings
     // - i.e. Port=8099, LimitMBPerSec=10, LimitClientCount=32,
@@ -1708,6 +1708,7 @@ type
       read fCachePermMinBytes  write fCachePermMinBytes;
     /// allow to customize the UUID used to identify this node
     // - instead of the default GetComputerUuid() from SMBios
+    // - should be a valid UUID/GUID text as recognized by RawUtf8ToGuid()
     property Uuid: RawUtf8
       read fUuid write fUuid;
   end;
@@ -1872,6 +1873,8 @@ type
   TOnHttpPeerCacheDirectOptions = function(var aUri: TUri; var aHeader: RawUtf8;
     var aOptions: THttpRequestExtendedOptions): integer of object;
 
+  EHttpServerCache = class(ESynException);
+
   /// implement a local peer-to-peer download cache via UDP and TCP
   // - UDP broadcasting is used for local peers discovery
   // - TCP is bound to a local THttpServer/THttpAsyncServer content delivery
@@ -2027,10 +2030,18 @@ procedure MsgToShort(const msg: THttpPeerCacheMessage; var result: ShortString);
 
 /// hash an URL and the "Etag:" or "Last-Modified:" headers
 // - could be used to identify a HTTP resource as a binary hash on a given server
+// - aHeaders could be supplied as nil so that only the URI resource is hashed
 // - returns 0 if aUrl/aHeaders have not enough information
 // - returns the number of hash bytes written to aDigest.Bin
 function HttpRequestHash(aAlgo: THashAlgo; const aUri: TUri;
   aHeaders: PUtf8Char; out aDigest: THashDigest): integer;
+
+/// hash an URL and the "Etag:" or "Last-Modified:" headers into 32 ascii chars
+// - you could set any custom aDiglen in 5/10/15/20/25/30 set
+// - aHeaders could be supplied as nil so that only the URI resource is hashed
+// - using SHA-256 and lowercase Base-32 encoding, so perfect for a file name
+function HttpRequestHashBase32(const aUri: TUri; aHeaders: PUtf8Char;
+  aDiglen: integer = 20): RawUtf8;
 
 /// get the content full length, from "Content-Length:" or "Content-Range:"
 function HttpRequestLength(aHeaders: PUtf8Char; out Len: PtrInt): PUtf8Char;
@@ -7814,12 +7825,11 @@ function HttpRequestHash(aAlgo: THashAlgo; const aUri: TUri;
 var
   hasher: TSynHasher;
   h: PUtf8Char;
-  l: PtrInt;
+  l: PtrInt; // var PtrInt, not integer
 begin
   result := 0;
   if (aUri.Server = '') or
      (aUri.Address = '') or
-     (aHeaders = nil) or
      not hasher.Init(aAlgo) then
     exit;
   hasher.Update(HTTPS_TEXT[aUri.Https]); // hash normalized URI
@@ -7829,25 +7839,38 @@ begin
   hasher.Update(aUri.Port);
   hasher.Update(@aAlgo, 1);
   hasher.Update(aUri.Address);
-  hasher.Update(@aAlgo, 1);
-  h := FindNameValuePointer(aHeaders, 'ETAG: ', l); // ETAG + URI are genuine
-  if h = nil then
+  if aHeaders <> nil then
   begin
-    // fallback to file date and full size
-    h := FindNameValuePointer(aHeaders, 'LAST-MODIFIED: ', l);
+    hasher.Update(@aAlgo, 1);
+    h := FindNameValuePointer(aHeaders, 'ETAG: ', l); // ETAG + URI are genuine
     if h = nil then
-      exit;
+    begin
+      // fallback to file date and full size
+      h := FindNameValuePointer(aHeaders, 'LAST-MODIFIED: ', l);
+      if h = nil then
+        exit;
+      hasher.Update(h, l);
+      h := HttpRequestLength(aHeaders, l);
+      if h = nil then
+        exit;
+    end;
     hasher.Update(h, l);
-    h := HttpRequestLength(aHeaders, l);
-    if h = nil then
-      exit;
   end;
-  hasher.Update(h, l);
   result := hasher.Final(aDigest.Bin);
   aDigest.Algo := aAlgo;
 end;
 
-
+function HttpRequestHashBase32(const aUri: TUri; aHeaders: PUtf8Char; aDiglen: integer): RawUtf8;
+var
+  dig: THashDigest;
+begin
+  if (aDigLen = 0) or
+     (aDigLen mod 5 <> 0) or
+     (HttpRequestHash(hfSHA256, aUri, aHeaders, dig) < aDiglen) then
+    result := ''
+  else // e.g. default aDigLen=20 bytes=160-bit as 32 chars
+    result := BinToBase32(@dig.Bin, aDiglen, {lower=}true);
+end;
 
 {$ifdef USEWININET}
 

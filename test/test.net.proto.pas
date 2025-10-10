@@ -1727,6 +1727,7 @@ var
   worker: array of TLoggedWorkThread; // as multi-threaded as possible
   agentcallback, consolecallback: array of ITunnelTransmit;
   agentlocal, consolelocal: array of TTunnelLocal;
+  sess: TTunnelSession;
   i, j, c: PtrInt;
   local: TNetPort;
 begin
@@ -1751,7 +1752,7 @@ begin
     check(Assigned(agentcallback[i]));
     check(Assigned(consolecallback[i]));
   end;
-  // 2) ITunnelConsole.TunnelPrepare() to retrieve a session
+  // 2) ITunnelConsole/ITunnelAgent.TunnelPrepare/TunnelAccept
   if Assigned(log) then
     log.Log(sllInfo, 'Tunnel: ITunnelOpen.TunnelPrepare', self);
   SetLength(session, AGENT_COUNT);
@@ -1759,20 +1760,28 @@ begin
   begin
     c := i mod length(console); // round-robin of agents over consoles
     Check(c <= high(console));
-    session[i] := console[c].TunnelPrepare(consolecallback[i]);
-    check(session[i] <> 0);
-    for j := 0 to i - 1 do
-      check(session[j] <> session[i], 'unique session');
-    // 3) ITunnelAgent.TunnelPrepare() with this session
     if i >= length(agent) then
       a := agent[0]
     else
       a := agent[i];
-    check(a.TunnelPrepare(session[i], agentcallback[i]));
+    if (i and 3) = 0 then // initiate from one endpoint or the other
+    begin
+      sess := console[c].TunnelPrepare(consolecallback[i]);
+      check(a.TunnelAccept(sess, agentcallback[i]));
+    end
+    else
+    begin
+      sess := a.TunnelPrepare(agentcallback[i]);
+      check(console[c].TunnelAccept(sess, consolecallback[i]));
+    end;
+    check(sess <> 0, 'session=0');
+    for j := 0 to i - 1 do
+      check(session[j] <> sess, 'unique session');
+    session[i] := sess;
   end;
   if not CheckEqual(relay.ConsoleCount, length(console), 'ConsoleCount') then
     exit; // all console[] should be connected to the relay
-  // 4) TTunnelLocal.Open() on the console and agent sides
+  // 3) TTunnelLocal.Open() on the console and agent sides
   if Assigned(log) then
     log.Log(sllInfo, 'Tunnel: reciprocal Open() handshake', self);
   try
@@ -1783,8 +1792,7 @@ begin
         a := agent[0]
       else
         a := agent[i];
-      worker[i] := TunnelBackgroundOpen(agentlocal[i],
-        session[i], a, nil, nil);
+      worker[i] := TunnelBackgroundOpen(agentlocal[i], session[i], a, nil, nil);
       c := i mod length(console); // round-robin of agents over consoles
       local := consolelocal[i].Open(
         session[i], console[c], tunneloptions, 1000, tunnelappsec, cLocalhost,
@@ -2831,6 +2839,13 @@ begin
   Check(dig.Algo = hfSHA256);
   CheckEqual(Sha256DigestToString(dig.Bin.Lo),
     '9b23e3b9894578f2709eca35aa9afad277ab5aa4afe9344192f59535719ac734');
+  CheckEqual(HttpRequestHashBase32(
+    U, 'Content-Length: 100'#13#10'Last-Modified: 2025'),
+    'tmr6homjiv4pe4e6zi22vgx22j32wwve');
+  CheckEqual(HttpRequestHashBase32(
+    U, 'Content-Length: 101'#13#10'Last-Modified: 2025'),
+    '5umuom5hoh7sohesrs3fqse4rweeum7d');
+  CheckEqual(HttpRequestHashBase32(U, nil), 'bq4n2dkrduzo2v3arzy2lafegac3wmbw');
 end;
 
 procedure TNetworkProtocols._THttpProxyCache;
